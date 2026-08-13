@@ -1,0 +1,15 @@
+# python repo gitignore
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+
+data/
+.pytest_cache/
+.vscode/
+prof/
+.claude/
+
+# training outputs
+runs/
+checkpoints/
+*.egg-info/
