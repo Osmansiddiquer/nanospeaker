@@ -3,10 +3,10 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 
-data/
+/data/          # corpora only; src/data is source, not data
 .pytest_cache/
 .vscode/
-prof/
+/prof/
 .claude/
 
 # training outputs
