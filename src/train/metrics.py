@@ -2,9 +2,9 @@
 Per-step metrics, one flat JSON object per line.
 
 Flat keys and one line per optimizer step, so a dashboard can tail the file and plot any
-field without parsing structure. Written with an fsync-free flush every line and a real
-flush every `sync_every` -- losing the last few lines to a crash is acceptable, losing
-the middle of the file to a partial write is not.
+field without parsing structure. Flushed every line by default: at ~14s per step a flush
+costs nothing, and buffering meant anything reading the file was up to 20 steps behind --
+which defeats the point of writing it at all.
 
 What is worth logging, and why, since a metric nobody can act on is a metric nobody
 should pay for:
@@ -19,21 +19,27 @@ should pay for:
   experts_unused               experts that saw nothing this step. Non-zero is a dead
                                capacity you paid for
   router_entropy               how decisive the router is; falling to 0 means collapse
-  tok_per_s, step_time_s       throughput, and where it went
+  ts                           wall-clock of the write, so steps can be placed in real time
+  tok_per_s, step_time_s       throughput, and the wall clock of the whole iteration
+  t_*_s                        where that clock went: forward, backward, optimiser, loader,
+                               validation, checkpointing. What they do not add up to is
+                               overhead, and it is worth seeing that gap
   mem_reserved_gb              the number that OOMs, not the allocated one
   mix_*                        realized source ratios, not the intended ones
 """
 
 import json
 import math
+import os
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
 
 
 class MetricsLogger:
-    def __init__(self, path, sync_every: int = 20, ema_beta: float = 0.98):
+    def __init__(self, path, sync_every: int = 1, ema_beta: float = 0.98):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.fh = self.path.open("a")
@@ -46,10 +52,19 @@ class MetricsLogger:
         return self.ema
 
     def log(self, **row) -> None:
+        # Wall-clock, so a step can be tied back to when it actually ran -- which log line
+        # was during the outage, which was after the restart. Unix seconds, UTC by
+        # construction; whoever reads it picks the timezone.
+        row.setdefault("ts", time.time())
         self.fh.write(json.dumps(row) + "\n")
         self.n += 1
         if self.n % self.sync_every == 0:
             self.fh.flush()
+        # flush() only reaches the page cache. A power cut between there and the disk is
+        # what produced a 752-byte NUL tail that broke every reader of this file; fsync
+        # bounds that window to 50 steps, for a few milliseconds against an 11 s step.
+        if self.n % 50 == 0:
+            os.fsync(self.fh.fileno())
 
     def close(self) -> None:
         self.fh.flush()
@@ -105,6 +120,47 @@ def update_norm_ratio(model, before: dict) -> float:
 
 def snapshot(model, names) -> dict:
     return {n: p.detach().clone() for n, p in model.named_parameters() if n in names}
+
+
+class GpuSpans:
+    """
+    GPU-side durations, without stalling the loop to get them.
+
+    A wall clock wrapped around a CUDA call measures when the work was *queued*, not when it
+    ran, so the CPU cannot tell forward from backward: both return immediately and the real
+    time surfaces at the next synchronisation. Events are timestamps the GPU writes into its
+    own stream as it passes them. Recording costs a few microseconds and no stall; they are
+    read once per step, after the sync the loop already performs.
+
+    Event pairs are recycled rather than reallocated, because at 12 micro-steps a step this
+    would otherwise create a few hundred CUDA events a minute for no reason.
+    """
+
+    def __init__(self, enabled: bool = True):
+        self.enabled, self.spans, self.free = enabled, [], []
+
+    @contextmanager
+    def span(self, name: str):
+        if not self.enabled:
+            yield
+            return
+        a, b = self.free.pop() if self.free else (
+            torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        a.record()
+        try:
+            yield
+        finally:
+            b.record()
+            self.spans.append((name, a, b))
+
+    def totals(self) -> dict:
+        """Seconds per span name since the last call. Only valid once the work has drained."""
+        out = {}
+        for name, a, b in self.spans:
+            out[name] = out.get(name, 0.0) + a.elapsed_time(b) / 1000.0
+            self.free.append((a, b))
+        self.spans.clear()
+        return out
 
 
 class Timer:

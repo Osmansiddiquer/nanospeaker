@@ -185,7 +185,20 @@ class KVCache:
 
 
 def make_kv_caches(
-    n_layers: int, max_seq_len: int, window: "int | None" = None, max_chunk: int = 1
+    n_layers: int, max_seq_len: int, window=None, max_chunk: int = 1
 ) -> "list[KVCache]":
-    """One cache per layer, to thread through a stack of attention blocks."""
-    return [KVCache(max_seq_len, window, max_chunk) for _ in range(n_layers)]
+    """
+    One cache per layer, to thread through a stack of attention blocks.
+
+    `window` is either one value for the whole stack or a per-layer sequence. The second
+    form is what an interleaved local/global stack needs: a global layer given a windowed
+    ring buffer would quietly forget everything older than the window, and the loss of
+    that history is invisible -- the shapes all still line up.
+    """
+    if isinstance(window, (list, tuple)):
+        if len(window) != n_layers:
+            raise ValueError(f"{len(window)} windows for {n_layers} layers")
+        windows = list(window)
+    else:
+        windows = [window] * n_layers
+    return [KVCache(max_seq_len, w, max_chunk) for w in windows]

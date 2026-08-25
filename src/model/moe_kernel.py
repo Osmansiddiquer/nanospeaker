@@ -21,16 +21,19 @@ token counts:
   * One GEMM launch per expert becomes one launch per matmul, with each tile finding
     its expert on device from the run offsets (kernel A).
   * The `[tokens, 2*d_hidden]` GLU intermediate never round-trips to HBM: the first
-    GEMM applies act(gate) * up in its epilogue (kernel B), and the second folds the
-    router-weight scale and the scatter-add back to token rows into its epilogue as
-    fp32 atomics (kernel C). On a 128-bit-bus card those two fusions are the point.
+    GEMM applies act(gate) * up in its epilogue (kernel B), and the second applies the
+    router-weight scale in its epilogue and stores per-pair rows that one token-major
+    reduce then sums in fp32 (kernel C). The scale is free on registers; the reduce
+    replaced an fp32 atomic-add epilogue after measuring 2x faster at nanoSpeaker's
+    d_expert 128, where the GEMM is too thin to hide read-modify-write traffic --
+    plain stores plus a streaming gather move fewer bytes than atomics into a zeroed
+    fp32 staging buffer, and the output is deterministic, which atomics never were.
 
 Dispatch (kernel D) is a counting sort: histogram the expert ids, block-align each
 expert's run to ALIGN_M rows (vLLM's `moe_align_block_size` trick -- a GEMM tile then
 never straddles two experts), and scatter each (token, expert) pair to its slot with
-an atomic cursor. Order within a run is arbitrary, which is fine: outputs are summed,
-and the fp32 atomic order was never deterministic -- exactly like the eager path's
-CUDA `index_add_`.
+an atomic cursor. Order within a run is arbitrary: the reduce reads each token's rows
+through the inverted sort, wherever they landed.
 
 Backward (section 6.6) reuses the same grouped structure: dH is a grouped GEMM against
 W_out read transposed (an index swap), dX one against a pre-transposed copy of W_in
@@ -47,8 +50,9 @@ Ampere notes: tiles are budgeted for sm_86's 100 KB shared memory, masked `tl.lo
 lowers to cp.async so `num_stages` still pipelines, and the grid is data-parallel with
 device-side early exit rather than persistent -- the persistent/TMA design from the
 H100 writeups has nothing to lean on here, and 20 SMs are saturated by tile count
-alone. Weight/output GEMMs autotune over a few configs; the atomic-accumulating
-kernels use a fixed config, because an autotuner re-running them would double-add.
+alone. Every GEMM and the reduce store rather than accumulate in place, so all of
+them autotune (an autotuner re-runs its candidates, which double-adds any atomic
+epilogue -- only the dispatch's int32 counters still add atomically, at fixed config).
 """
 
 from typing import Optional
@@ -154,31 +158,36 @@ def _expert_ids_kernel(off_ptr, npp_ptr, eid_ptr, E, BM: tl.constexpr, E_POW2: t
 
 
 @triton.jit
-def _scatter_kernel(topk_ptr, off_ptr, cur_ptr, sorted_ptr, M, BLOCK: tl.constexpr):
+def _scatter_kernel(topk_ptr, off_ptr, cur_ptr, sorted_ptr, inv_ptr, M, BLOCK: tl.constexpr):
     """
     Counting-sort scatter: pair i lands at its run's offset plus an atomic cursor rank.
 
     Ranks are dense in [0, counts[e]), so each run's real pairs form a prefix and the
     block-alignment padding stays at the tail, already holding the sentinel from init.
+    The inverse (inv[pair] = slot) is one extra store here, where the destination is
+    already in hand -- `_reduce_kernel` reads each token's rows through it.
     """
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < M
     e = tl.load(topk_ptr + offs, mask=mask, other=0)
     base = tl.load(off_ptr + e, mask=mask, other=0)
     rank = tl.atomic_add(cur_ptr + e, 1, mask=mask)
-    tl.store(sorted_ptr + base + rank, offs.to(tl.int32), mask=mask)
+    dst = base + rank
+    tl.store(sorted_ptr + dst, offs.to(tl.int32), mask=mask)
+    tl.store(inv_ptr + offs, dst.to(tl.int32), mask=mask)
 
 
 @torch.library.custom_op("autoreg::moe_dispatch", mutates_args=())
 def moe_dispatch(topk_idx: torch.Tensor, n_experts: int) -> tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
     """
     Sort the (token, expert) pairs into block-aligned per-expert runs, on device.
 
     Returns int32 tensors: sorted pair ids [l_cap] (flat index into topk_idx, sentinel
     M in pad slots), aligned-block->expert map [l_cap / ALIGN_M], run offsets [E + 1],
-    routing counts [E] (for the balance loss), and the true padded length [1].
+    routing counts [E] (for the balance loss), the true padded length [1], and the
+    sort's inverse [M] (pair -> slot, fully written: every real pair holds one slot).
     """
     flat = topk_idx.reshape(-1).contiguous()
     m = flat.numel()
@@ -190,13 +199,14 @@ def moe_dispatch(topk_idx: torch.Tensor, n_experts: int) -> tuple[
     offs = torch.zeros(n_experts + 1, dtype=i32, device=dev)
     npp = torch.zeros(1, dtype=i32, device=dev)
     sids = torch.full((l_cap,), m, dtype=i32, device=dev)         # all-sentinel start
+    inv = torch.empty(m, dtype=i32, device=dev)
     if m:
         ep2 = triton.next_power_of_2(n_experts)
         _count_kernel[(triton.cdiv(m, 512),)](flat, counts, m, BLOCK=512)
         _scan_kernel[(1,)](counts, offs, npp, n_experts, BM=ALIGN_M, E_POW2=ep2)
         _expert_ids_kernel[(l_cap // ALIGN_M,)](offs, npp, eids, n_experts, BM=ALIGN_M, E_POW2=ep2)
-        _scatter_kernel[(triton.cdiv(m, 512),)](flat, offs, cursor, sids, m, BLOCK=512)
-    return sids, eids, offs, counts, npp
+        _scatter_kernel[(triton.cdiv(m, 512),)](flat, offs, cursor, sids, inv, m, BLOCK=512)
+    return sids, eids, offs, counts, npp, inv
 
 
 @moe_dispatch.register_fake
@@ -204,7 +214,8 @@ def _(topk_idx, n_experts):
     # Shapes are pure functions of (numel, E), which is what makes this traceable.
     l_cap = _l_cap(topk_idx.numel(), n_experts)
     mk = lambda n: topk_idx.new_empty((n,), dtype=torch.int32)
-    return mk(l_cap), mk(l_cap // ALIGN_M), mk(n_experts + 1), mk(n_experts), mk(1)
+    return (mk(l_cap), mk(l_cap // ALIGN_M), mk(n_experts + 1), mk(n_experts), mk(1),
+            mk(topk_idx.numel()))
 
 
 # --- the gate activation, in-kernel (fp32; dead branches are pruned per ACT) --------
@@ -314,21 +325,24 @@ def _gemm1_kernel(
 
 # --- kernel C (and its backward twins): grouped GEMM core with epilogue variants ----
 
-# Fixed configs rather than autotune: in ATOMIC mode the kernel *accumulates* into
-# its output, so an autotuner re-running configs would corrupt it. Chosen by an
-# offline sweep on sm_86 at the review's reference shape (d_model=512, d_hidden=1365,
-# 8k pairs, bf16); per-mode because the winners genuinely differ.
-_K2_FWD = dict(BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, num_warps=8, num_stages=2)
-_K2_G = dict(BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, num_warps=4, num_stages=3)
-_K2_DX = dict(BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, num_warps=8, num_stages=3)
+def _gemm2_configs():
+    # BLOCK_M must divide ALIGN_M (a sub-block's expert is its aligned block's).
+    # BLOCK_N=128 wins where N_DIM=576 (nanoSpeaker d_model); 64 wins at 512.
+    return [
+        triton.Config(dict(BLOCK_M=64, BLOCK_N=64, BLOCK_K=64), num_warps=8, num_stages=2),
+        triton.Config(dict(BLOCK_M=64, BLOCK_N=128, BLOCK_K=64), num_warps=8, num_stages=2),
+        triton.Config(dict(BLOCK_M=32, BLOCK_N=64, BLOCK_K=64), num_warps=4, num_stages=2),
+        triton.Config(dict(BLOCK_M=64, BLOCK_N=64, BLOCK_K=32), num_warps=4, num_stages=3),
+    ]
 
 
+@triton.autotune(configs=_gemm2_configs(), key=["K_DIM", "N_DIM"])
 @triton.jit
 def _gemm2_kernel(
     a_ptr, b_ptr, bias_ptr, tw_ptr, sorted_ptr, eid_ptr, npp_ptr, out_ptr,
     M, TOPK, K_DIM, N_DIM,
     PREC: tl.constexpr, GATHER_A: tl.constexpr, B_TRANS: tl.constexpr,
-    APPLY_W: tl.constexpr, HAS_BIAS: tl.constexpr, ATOMIC: tl.constexpr,
+    APPLY_W: tl.constexpr, HAS_BIAS: tl.constexpr,
     ALIGN_M: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -336,17 +350,19 @@ def _gemm2_kernel(
     One grouped-GEMM body, three uses (B_TRANS reads the [N_DIM, K_DIM] stack as its
     transpose -- an index swap, not a copy):
 
-      forward out:  A = H by slot,  B = W_out[e],   *router weight, atomic-add by token
-      backward dX:  A = dA1 by slot, B = W_in[e]^T (pre-transposed), atomic by token
-      backward dH:  A = dOut by token (gather),  B = W_out[e]^T,  plain store by slot
+      forward out:  A = H by slot,   B = W_out[e],  *router weight, store by slot
+      backward dX:  A = dA1 by slot, B = W_in[e]^T (pre-transposed), store by slot
+      backward dH:  A = dOut by token (gather),  B = W_out[e]^T,  store by slot
 
     The transpose is spelled as two literal-index branches rather than stride
     arguments so the compiler can *see* which axis is contiguous: runtime strides
     de-vectorize the B loads, which measured as ~3x on this whole kernel.
 
-    The atomic epilogue is kernel C: the per-expert index_add_ launches and their
-    staging buffer collapse into this store. Accumulation is fp32 (the buffer, not
-    just the math), so bf16 contributions don't round away (review.md 6.3).
+    The store is always by slot: the sum of each token's top_k rows happens in
+    `_reduce_kernel` afterwards (kernel C's second half). Storing beat an fp32
+    atomic-add epilogue at every measured shape -- 2x at d_expert 128, where two
+    BLOCK_K steps of compute cannot hide 4-byte read-modify-write traffic -- and a
+    store-only kernel is safe to autotune.
     """
     pid_m, pid_n = tl.program_id(0), tl.program_id(1)
     if pid_m * BLOCK_M >= tl.load(npp_ptr):
@@ -382,11 +398,43 @@ def _gemm2_kernel(
         w = tl.load(tw_ptr + pair, mask=valid, other=0.0).to(tl.float32)
         acc *= w[:, None]
     omask = valid[:, None] & ncols[None, :]
-    if ATOMIC:                                         # top_k rows sum onto one token row
-        tl.atomic_add(out_ptr + tok[:, None] * N_DIM + rn[None, :], acc, mask=omask)
-    else:
-        tl.store(out_ptr + slots.to(tl.int64)[:, None] * N_DIM + rn[None, :],
-                 acc.to(out_ptr.dtype.element_ty), mask=omask)
+    tl.store(out_ptr + slots.to(tl.int64)[:, None] * N_DIM + rn[None, :],
+             acc.to(out_ptr.dtype.element_ty), mask=omask)
+
+
+def _reduce_configs():
+    # Pure byte movement: the knobs trade gather width against rows in flight.
+    return [
+        triton.Config(dict(BM=8, BD=256), num_warps=4),
+        triton.Config(dict(BM=16, BD=256), num_warps=4),
+        triton.Config(dict(BM=16, BD=128), num_warps=4),
+        triton.Config(dict(BM=32, BD=128), num_warps=4),
+    ]
+
+
+@triton.autotune(configs=_reduce_configs(), key=["TOPK", "D"])
+@triton.jit
+def _reduce_kernel(y_ptr, inv_ptr, out_ptr, N_TOK, TOPK, D,
+                   BM: tl.constexpr, BD: tl.constexpr):
+    """
+    out[t] = sum_k y[inv[t*TOPK + k]]: each token gathers its top_k slot rows and sums
+    them in fp32. This replaces the atomic epilogue where the GEMM above it is too thin
+    to hide the read-modify-write (small d_expert): plain stores plus one streaming
+    gather cost fewer bytes than fp32 atomics into a zeroed staging buffer, and the
+    forward comes out deterministic. Reads touch only real rows -- inv skips the pad.
+    """
+    pid_m, pid_d = tl.program_id(0), tl.program_id(1)
+    toks = pid_m * BM + tl.arange(0, BM)
+    tmask = toks < N_TOK
+    cols = pid_d * BD + tl.arange(0, BD)
+    omask = tmask[:, None] & (cols < D)[None, :]
+    acc = tl.zeros((BM, BD), tl.float32)
+    for k in range(TOPK):
+        slot = tl.load(inv_ptr + toks * TOPK + k, mask=tmask, other=0).to(tl.int64)
+        acc += tl.load(y_ptr + slot[:, None] * D + cols[None, :],
+                       mask=omask, other=0.0).to(tl.float32)
+    tl.store(out_ptr + toks.to(tl.int64)[:, None] * D + cols[None, :],
+             acc.to(out_ptr.dtype.element_ty), mask=omask)
 
 
 # --- backward: per-expert dW = A^T @ B over that expert's run -----------------------
@@ -520,12 +568,18 @@ def moe_experts(
     pad_offsets: torch.Tensor,
     counts: torch.Tensor,
     n_post_pad: torch.Tensor,
+    inv_ids: torch.Tensor,
     activation: str,
 ) -> torch.Tensor:
     """
     The routed experts on pre-dispatched pairs: out[t] = sum_e w * expert_e(x[t]).
 
-    Two launches. Inputs must share x's dtype (the wrapper casts); output matches it.
+    Three launches -- gemm1, gemm2 (stores weighted per-pair rows), and the
+    token-major reduce that sums each token's top_k rows in fp32 through `inv_ids`.
+    Store-and-reduce replaced a zeroed fp32 staging buffer with an atomic-add
+    epilogue and a cast: at small d_expert the atomics dominated the whole block
+    (measured 2x on this stage at nanoSpeaker's shape), and this way the forward is
+    deterministic. Inputs must share x's dtype (the wrapper casts); output matches it.
     """
     x, w_in, w_out = x.contiguous(), w_in.contiguous(), w_out.contiguous()
     n, d = x.shape
@@ -536,30 +590,36 @@ def moe_experts(
     act, prec = KERNEL_ACTIVATIONS[activation], _dot_precision(x.dtype)
     tw = topk_w.reshape(-1).contiguous()
 
+    if not l_cap:
+        return x.new_zeros((n, d))
     hid = x.new_empty((l_cap, h))
-    if l_cap:
-        grid = lambda meta: (triton.cdiv(l_cap, meta["BLOCK_M"]), triton.cdiv(h, meta["BLOCK_N"]))
-        _gemm1_kernel[grid](
-            x, w_in, b_in if b_in is not None else w_in, sorted_ids, expert_ids,
-            n_post_pad, hid, hid,                      # a1_ptr unused: any tensor works
-            m, topk, d, h, ACT=act, PREC=prec, HAS_BIAS=b_in is not None,
-            WRITE_H=True, WRITE_A1=False, ALIGN_M=ALIGN_M,
-        )
-    out32 = torch.zeros((n, d), dtype=torch.float32, device=x.device)
-    if l_cap:
-        _gemm2_kernel[(l_cap // _K2_FWD["BLOCK_M"], triton.cdiv(d, _K2_FWD["BLOCK_N"]))](
-            hid, w_out, b_out if b_out is not None else w_out, tw, sorted_ids,
-            expert_ids, n_post_pad, out32,
-            m, topk, h, d,                             # B = W_out[e], untransposed
-            PREC=prec, GATHER_A=False, B_TRANS=False, APPLY_W=True,
-            HAS_BIAS=b_out is not None, ATOMIC=True, ALIGN_M=ALIGN_M, **_K2_FWD,
-        )
-    return out32.to(x.dtype)
+    grid = lambda meta: (triton.cdiv(l_cap, meta["BLOCK_M"]), triton.cdiv(h, meta["BLOCK_N"]))
+    _gemm1_kernel[grid](
+        x, w_in, b_in if b_in is not None else w_in, sorted_ids, expert_ids,
+        n_post_pad, hid, hid,                          # a1_ptr unused: any tensor works
+        m, topk, d, h, ACT=act, PREC=prec, HAS_BIAS=b_in is not None,
+        WRITE_H=True, WRITE_A1=False, ALIGN_M=ALIGN_M,
+    )
+    # Per-pair expert outputs, router-weighted in the epilogue. Pad slots are never
+    # stored and never read back (inv indexes real pairs only), so no zero-fill.
+    y = x.new_empty((l_cap, d))
+    grid2 = lambda meta: (triton.cdiv(l_cap, meta["BLOCK_M"]), triton.cdiv(d, meta["BLOCK_N"]))
+    _gemm2_kernel[grid2](
+        hid, w_out, b_out if b_out is not None else w_out, tw, sorted_ids,
+        expert_ids, n_post_pad, y,
+        m, topk, h, d,                                 # B = W_out[e], untransposed
+        PREC=prec, GATHER_A=False, B_TRANS=False, APPLY_W=True,
+        HAS_BIAS=b_out is not None, ALIGN_M=ALIGN_M,
+    )
+    out = x.new_empty((n, d))
+    grid_r = lambda meta: (triton.cdiv(n, meta["BM"]), triton.cdiv(d, meta["BD"]))
+    _reduce_kernel[grid_r](y, inv_ids, out, n, topk, d)
+    return out
 
 
 @moe_experts.register_fake
 def _(x, w_in, w_out, topk_w, b_in, b_out, sorted_ids, expert_ids, pad_offsets,
-      counts, n_post_pad, activation):
+      counts, n_post_pad, inv_ids, activation):
     return x.new_empty(x.shape)
 
 
@@ -576,6 +636,7 @@ def _moe_experts_bwd(
     pad_offsets: torch.Tensor,
     counts: torch.Tensor,
     n_post_pad: torch.Tensor,
+    inv_ids: torch.Tensor,
     activation: str,
     need_db_in: bool,
     need_db_out: bool,
@@ -613,11 +674,12 @@ def _moe_experts_bwd(
     # G = dOut @ W_out^T per expert, *unscaled* -- so the same tensor serves both the
     # GLU backward (scaled by w there) and the router-weight grad <G, hidden>.
     gbuf = x.new_empty((l_cap, h))
-    _gemm2_kernel[(l_cap // _K2_G["BLOCK_M"], triton.cdiv(h, _K2_G["BLOCK_N"]))](
+    grid_g = lambda meta: (triton.cdiv(l_cap, meta["BLOCK_M"]), triton.cdiv(h, meta["BLOCK_N"]))
+    _gemm2_kernel[grid_g](
         grad_out, w_out, w_out, tw, sorted_ids, expert_ids, n_post_pad, gbuf,
         m, topk, d, h,                                 # B = W_out[e]^T (B_TRANS)
         PREC=prec, GATHER_A=True, B_TRANS=True, APPLY_W=False, HAS_BIAS=False,
-        ATOMIC=False, ALIGN_M=ALIGN_M, **_K2_G,
+        ALIGN_M=ALIGN_M,
     )
 
     # GLU backward per row: dA1, the router-weight grads, and H for the dW_out GEMM.
@@ -629,18 +691,23 @@ def _moe_experts_bwd(
         ACT=act, ZERO_INVALID=need_db_in, BLOCK_H=128,
     )
 
-    # dX: the gather's backward is a scatter -- same atomic epilogue as the forward.
+    # dX: the gather's backward is a sum over each token's top_k rows -- same
+    # store-then-reduce as the forward output (dA1 already carries the router weight).
     # W_in^T is materialized rather than index-swapped: W_in rows are 2H*2 = 5460 B,
     # and reading them transposed means every load sits at a 16B-misaligned offset.
     # The 22 MB copy measured ~0.5 ms against ~2.6 ms saved on this GEMM.
     w_in_t = w_in.transpose(1, 2).contiguous()
-    dx32 = torch.zeros((n, d), dtype=torch.float32, device=x.device)
-    _gemm2_kernel[(l_cap // _K2_DX["BLOCK_M"], triton.cdiv(d, _K2_DX["BLOCK_N"]))](
-        da1, w_in_t, w_in_t, tw, sorted_ids, expert_ids, n_post_pad, dx32,
+    ydx = x.new_empty((l_cap, d))
+    grid_dx = lambda meta: (triton.cdiv(l_cap, meta["BLOCK_M"]), triton.cdiv(d, meta["BLOCK_N"]))
+    _gemm2_kernel[grid_dx](
+        da1, w_in_t, w_in_t, tw, sorted_ids, expert_ids, n_post_pad, ydx,
         m, topk, 2 * h, d,                             # B = W_in[e]^T, pre-transposed
         PREC=prec, GATHER_A=False, B_TRANS=False, APPLY_W=False, HAS_BIAS=False,
-        ATOMIC=True, ALIGN_M=ALIGN_M, **_K2_DX,
+        ALIGN_M=ALIGN_M,
     )
+    dx = x.new_empty((n, d))
+    grid_r = lambda meta: (triton.cdiv(n, meta["BM"]), triton.cdiv(d, meta["BD"]))
+    _reduce_kernel[grid_r](ydx, inv_ids, dx, n, topk, d)
 
     dw_in = torch.empty_like(w_in)
     grid_a = lambda meta: (e_n, triton.cdiv(d, meta["BLOCK_A"]) * triton.cdiv(2 * h, meta["BLOCK_B"]))
@@ -669,12 +736,12 @@ def _moe_experts_bwd(
         db_out = torch.zeros((e_n, d), dtype=x.dtype, device=x.device) \
             .index_add_(0, eps, dyw)
 
-    return dx32.to(x.dtype), dw_in, dw_out, dtw.view_as(topk_w), db_in, db_out
+    return dx, dw_in, dw_out, dtw.view_as(topk_w), db_in, db_out
 
 
 @_moe_experts_bwd.register_fake
 def _(grad_out, x, w_in, w_out, topk_w, b_in, sorted_ids, expert_ids, pad_offsets,
-      counts, n_post_pad, activation, need_db_in, need_db_out):
+      counts, n_post_pad, inv_ids, activation, need_db_in, need_db_out):
     e_n, _, h2 = w_in.shape
     return (torch.empty_like(x), torch.empty_like(w_in), torch.empty_like(w_out),
             torch.empty_like(topk_w),
@@ -684,10 +751,11 @@ def _(grad_out, x, w_in, w_out, topk_w, b_in, sorted_ids, expert_ids, pad_offset
 
 def _moe_experts_setup(ctx, inputs, output):
     (x, w_in, w_out, topk_w, b_in, b_out, sorted_ids, expert_ids, pad_offsets,
-     counts, n_post_pad, activation) = inputs
+     counts, n_post_pad, inv_ids, activation) = inputs
     # b_in is a real backward input (the recomputed pre-activation includes it);
     # b_out's value is never needed, only whether its gradient is.
-    saved = [x, w_in, w_out, topk_w, sorted_ids, expert_ids, pad_offsets, counts, n_post_pad]
+    saved = [x, w_in, w_out, topk_w, sorted_ids, expert_ids, pad_offsets, counts,
+             n_post_pad, inv_ids]
     if b_in is not None:
         saved.append(b_in)
     ctx.save_for_backward(*saved)
@@ -699,14 +767,14 @@ def _moe_experts_setup(ctx, inputs, output):
 def _moe_experts_backward(ctx, grad_out):
     """Thin traceable hook: unpack the ctx and hand everything to the backward op."""
     (x, w_in, w_out, topk_w, sorted_ids, expert_ids, pad_offsets, counts,
-     n_post_pad, *rest) = ctx.saved_tensors
+     n_post_pad, inv_ids, *rest) = ctx.saved_tensors
     b_in = rest[0] if ctx.has_b_in else None
     dx, dw_in, dw_out, dtw, db_in, db_out = _moe_experts_bwd(
         grad_out, x, w_in, w_out, topk_w, b_in, sorted_ids, expert_ids, pad_offsets,
-        counts, n_post_pad, ctx.activation, ctx.has_b_in, ctx.has_b_out,
+        counts, n_post_pad, inv_ids, ctx.activation, ctx.has_b_in, ctx.has_b_out,
     )
     return (dx, dw_in, dw_out, dtw, db_in if ctx.has_b_in else None,
-            db_out if ctx.has_b_out else None, None, None, None, None, None, None)
+            db_out if ctx.has_b_out else None, None, None, None, None, None, None, None)
 
 
 moe_experts.register_autograd(_moe_experts_backward, setup_context=_moe_experts_setup)
@@ -726,10 +794,10 @@ def fused_moe_forward(x, w_in, w_out, topk_w, topk_idx, b_in, b_out, activation)
             f"activation {activation!r} has no kernel; use one of "
             f"{sorted(set(KERNEL_ACTIVATIONS))} or fall back to the eager path."
         )
-    sids, eids, offs, counts, npp = moe_dispatch(topk_idx, w_in.shape[0])
+    sids, eids, offs, counts, npp, inv = moe_dispatch(topk_idx, w_in.shape[0])
     # The GEMMs run in x's dtype, exactly as autocast would run the eager matmuls, so
     # params are cast here (a no-op off autocast; grads flow back through the cast).
     cast = lambda t: None if t is None else t.to(x.dtype)
     out = moe_experts(x, cast(w_in), cast(w_out), topk_w.to(x.dtype), cast(b_in),
-                      cast(b_out), sids, eids, offs, counts, npp, activation)
+                      cast(b_out), sids, eids, offs, counts, npp, inv, activation)
     return out, counts

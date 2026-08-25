@@ -3,7 +3,8 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 
-/data/          # corpora only; src/data is source, not data
+# corpora only; src/data is source, not data
+/data/
 .pytest_cache/
 .vscode/
 /prof/
@@ -13,3 +14,47 @@ __pycache__/
 runs/
 checkpoints/
 *.egg-info/
+
+# stray artifacts from unrelated sessions (inspect _trash/ then delete)
+_trash/
+*.db
+scratch.ipynb
+
+# Stray files from unrelated sessions living in the repo root. Listed explicitly
+# rather than moved, so nothing in the working tree is disturbed by publishing.
+/albums.json
+/another_key.json
+/data.csv
+/example.txt
+/file_list.txt
+/json_updated.json
+/name
+/new_list.json
+/non_existent_file.txt
+/output
+/output.csv
+/output.html
+/output.json
+/output.txt
+/output_path
+/path
+/products.csv
+/products.html
+/products.json.json
+/report.json
+/sales_report.csv
+/sample.csv
+/sample.py
+/students.csv
+/test.py
+/test.csv
+/test[0-9].csv
+/test2.txt
+
+# Per-run artefacts written beside the code
+/runs/
+/_trash/
+*.bin
+*.mask
+*.idx
+*.pt

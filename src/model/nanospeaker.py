@@ -91,8 +91,44 @@ class NanoSpeakerConfig:
     rope_base: float = 10_000.0
     rope_p: float = 1.0                                # 1.0 = plain RoPE, < 1 truncates
     window: "int | None" = None                        # sliding window, or None for full
+    global_every: "int | None" = None                  # every Nth layer sees everything
     std: float = 0.02
     checkpoint: bool = True
+    ckpt_skip: int = 0                                 # blocks left un-checkpointed
+
+    def layer_window(self, i: int) -> "int | None":
+        """
+        The attention span of layer `i`: None for full attention, else `window`.
+
+        A stack that is entirely windowed cannot see further than `window` no matter how
+        deep it is; a stack that is entirely global costs O(T^2) everywhere. Interleaving
+        them -- three windowed layers to one global, at `global_every=4` -- keeps most of
+        the cheap locality while leaving a path for information to cross the whole
+        sequence every fourth layer. It is also what makes a long KV cache affordable at
+        inference: only the global layers hold the full history.
+        """
+        if self.global_every and i % self.global_every == 0:
+            return None
+        return self.window
+
+    def layer_windows(self) -> list:
+        return [self.layer_window(i) for i in range(self.n_layers)]
+
+    @property
+    def unckpt_blocks(self) -> frozenset:
+        """
+        Indices of the blocks that keep their activations instead of recomputing them.
+
+        Checkpointing every block trades ~2 GiB for a second forward pass over all 20.
+        Spare memory is therefore spare speed, and on a card with ~0.4 GiB to give back
+        the exchange rate is good: two blocks off recompute took the backward from 7.70
+        to 7.42 s. Spread evenly rather than clustered, so no single point in the graph
+        holds an unusual amount at once.
+        """
+        if not self.ckpt_skip:
+            return frozenset()
+        stride = self.n_layers / self.ckpt_skip
+        return frozenset(int(i * stride) for i in range(self.ckpt_skip))
 
     @property
     def d_ff_expert(self) -> int:
@@ -103,19 +139,26 @@ class NanoSpeakerConfig:
 class Block(nn.Module):
     """Pre-norm: attention and FFN each read a normalized copy and write to the residual."""
 
-    def __init__(self, cfg: NanoSpeakerConfig, rope: RotaryPositionalEmbedding):
+    def __init__(self, cfg: NanoSpeakerConfig, rope: RotaryPositionalEmbedding,
+                 layer_idx: int = 0):
         super().__init__()
         self.norm_attn = RMSNorm(cfg.d_model)
         self.attn = OptimizedMultiHeadAttention(
             cfg.d_model, cfg.n_heads, cfg.d_head, cfg.d_head,
-            mask=True, rope=rope, n_kv_heads=cfg.n_kv_heads, window=cfg.window,
+            mask=True, rope=rope, n_kv_heads=cfg.n_kv_heads,
+            window=cfg.layer_window(layer_idx),
             qk_norm=True, std=cfg.std, n_layers=cfg.n_layers,
         )
         self.norm_ffn = RMSNorm(cfg.d_model)
         self.ffn = MoEBlock(
             cfg.d_model, cfg.n_experts, cfg.d_ff_expert, top_k=cfg.top_k,
             n_shared=cfg.n_shared, capacity_factor=cfg.capacity_factor,
-            normalize_weights=False,                   # gate = the selected affinity
+            # Renormalized so the selected gates sum to 1. Unnormalized, top-6 of 76
+            # summed to ~0.08 at init, which scaled every FFN output to a twelfth of
+            # itself and let the model reduce loss by sharpening the router rather than
+            # by learning anything in the experts. Mixtral normalizes; DeepSeek-V3 added
+            # it after V2 did not.
+            normalize_weights=True,
             aux_loss_coef=cfg.aux_loss_coef, noise_std=cfg.noise_std, std=cfg.std,
         )
 
@@ -147,7 +190,7 @@ class NanoSpeaker(nn.Module):
         rope = RotaryPositionalEmbedding(
             cfg.d_head, base=cfg.rope_base, p=cfg.rope_p, max_seq_len=cfg.max_seq_len
         )
-        self.blocks = nn.ModuleList(Block(cfg, rope) for _ in range(cfg.n_layers))
+        self.blocks = nn.ModuleList(Block(cfg, rope, i) for i in range(cfg.n_layers))
         self.norm_out = RMSNorm(cfg.d_model)
         self.fused_ce = LigerFusedLinearCrossEntropyLoss() if _HAS_LIGER else None
 
@@ -165,9 +208,11 @@ class NanoSpeaker(nn.Module):
 
     def caches(self, max_seq_len: "int | None" = None, max_chunk: int = 1):
         """One KV cache per layer, window-sized when the model attends over a window."""
+        # Per-layer windows: a mixed stack must not be handed one shared window, or
+        # the global layers would silently get a ring buffer sized for the local ones.
         return make_kv_caches(
             self.cfg.n_layers, max_seq_len or self.cfg.max_seq_len,
-            self.cfg.window, max_chunk,
+            self.cfg.layer_windows(), max_chunk,
         )
 
     # --- forward -------------------------------------------------------------------
@@ -175,8 +220,9 @@ class NanoSpeaker(nn.Module):
     def trunk(self, idx: torch.Tensor, caches=None):
         x, aux = self.embed(idx), idx.new_zeros((), dtype=torch.float32)
         caches = caches or [None] * len(self.blocks)
-        for block, cache in zip(self.blocks, caches):
-            if self.cfg.checkpoint and self.training and cache is None:
+        skip = self.cfg.unckpt_blocks
+        for i, (block, cache) in enumerate(zip(self.blocks, caches)):
+            if self.cfg.checkpoint and i not in skip and self.training and cache is None:
                 # Reentrant: the non-reentrant path never frees a block's recompute.
                 x, a = checkpoint(block, x, use_reentrant=True)
             else:

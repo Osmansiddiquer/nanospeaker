@@ -10,9 +10,16 @@ class RMSNorm(nn.Module):
     reduction, a subtraction and the shift parameter. What remains is a rescale by the
     RMS of the features, which is the part that actually stabilizes the residual stream.
 
-    `F.rms_norm` is one fused kernel with a hand-written backward. Spelling the maths out
-    instead (`x.float().pow(2).mean(...)`) keeps two fp32 copies of the activation alive
-    per call for autograd -- at 80 calls in a 20-layer model that measured 614 MiB.
+    `F.rms_norm` is still the right call here, but not for the reason first written down:
+    on torch 2.6+cu126 it is *not* one fused kernel. Profiling one call shows generic
+    `reduce_kernel` and `elementwise_kernel` launches -- the same pow/mean/rsqrt chain,
+    in fp32, just spelled by ATen instead of by us. What it does keep is the autograd
+    footprint: writing the maths out holds two fp32 copies of the activation alive per
+    call, which at 80 calls in a 20-layer model measured 614 MiB.
+
+    So the memory argument stands and the speed argument never did. The speed is
+    recovered instead by compiling the module (see train.py `--compile-norms`), which
+    fuses the chain into one inductor kernel and is worth 27% of the training step.
     """
 
     def __init__(self, d: int, epsilon: float = 1e-6, fused: bool = True):

@@ -197,8 +197,10 @@ def test_auto_default_hands_cuda_blocks_to_the_kernel():
 def test_dispatch_invariants():
     """White-box check of the counting sort: dense prefixes, sentinels, block owners."""
     topk_idx = torch.randint(0, 8, (50, 2), device="cuda")
-    sids, eids, offs, counts, npp = moe_dispatch(topk_idx, 8)
+    sids, eids, offs, counts, npp, inv = moe_dispatch(topk_idx, 8)
     m = topk_idx.numel()
+    assert torch.equal(sids[inv.long()],                # inv really inverts the sort
+                       torch.arange(m, device="cuda", dtype=torch.int32))
     assert torch.equal(counts.long(), torch.bincount(topk_idx.reshape(-1), minlength=8))
     assert int(npp) == int((torch.ceil(counts.float() / ALIGN_M) * ALIGN_M).sum())
 
@@ -215,8 +217,8 @@ def test_dispatch_invariants():
 
 
 def test_dispatch_handles_no_pairs():
-    sids, eids, offs, counts, npp = moe_dispatch(torch.zeros(0, 2, dtype=torch.long, device="cuda"), 8)
-    assert sids.numel() == 0 and int(npp) == 0 and int(counts.sum()) == 0
+    sids, eids, offs, counts, npp, inv = moe_dispatch(torch.zeros(0, 2, dtype=torch.long, device="cuda"), 8)
+    assert sids.numel() == 0 and int(npp) == 0 and int(counts.sum()) == 0 and inv.numel() == 0
 
 
 def test_opcheck_both_ops():
@@ -228,12 +230,12 @@ def test_opcheck_both_ops():
     x = torch.randn(10, 32, device="cuda")
     with torch.no_grad():
         topk_w, topk_idx, _ = m.router(x)
-    sids, eids, offs, counts, npp = moe_dispatch(topk_idx, 4)
+    sids, eids, offs, counts, npp, inv = moe_dispatch(topk_idx, 4)
     torch.library.opcheck(moe_experts, (
         x.clone().requires_grad_(True), m.W_in.detach().clone().requires_grad_(True),
         m.W_out.detach().clone().requires_grad_(True),
         topk_w.clone().requires_grad_(True), None, None,
-        sids, eids, offs, counts, npp, "silu",
+        sids, eids, offs, counts, npp, inv, "silu",
     ))
 
 

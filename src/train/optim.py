@@ -46,6 +46,11 @@ class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr=0.02, momentum=0.95, weight_decay=0.1, ns_steps=5):
         super().__init__(params, dict(lr=lr, momentum=momentum,
                                       weight_decay=weight_decay, ns_steps=ns_steps))
+        # ||dW|| and ||W||, accumulated during the step that produces them. Cloning the
+        # parameters to diff them afterwards costs a full bf16 copy of the model per
+        # logged step, which is 0.73 GB here and OOMs a 4 GB card.
+        self._update_sq = 0.0
+        self._param_sq = 0.0
 
     def load_state_dict(self, state_dict):
         """Restore, then put the momentum back in bf16.
@@ -61,8 +66,15 @@ class Muon(torch.optim.Optimizer):
                 if "momentum" in st:
                     st["momentum"] = st["momentum"].bfloat16()
 
+    def update_norm_ratio(self) -> float:
+        """||dW|| / ||W|| for the most recent step -- the earliest divergence signal."""
+        if not torch.is_tensor(self._update_sq):
+            return 0.0
+        return float((self._update_sq / self._param_sq.clamp(min=1e-12)).sqrt())
+
     @torch.no_grad()
     def step(self):
+        self._update_sq = self._param_sq = 0.0    # replaced by tensors below
         for group in self.param_groups:
             for p in group["params"]:
                 if p.grad is None:
@@ -83,8 +95,14 @@ class Muon(torch.optim.Optimizer):
                 # Wider-than-tall matrices take larger steps under an orthogonal update,
                 # so the scale compensates by the aspect ratio.
                 scale = max(1.0, p.size(-2) / p.size(-1)) ** 0.5
+                delta = update.to(p.dtype) * (-group["lr"] * scale)
                 p.mul_(1 - group["lr"] * group["weight_decay"])
-                p.add_(update.to(p.dtype), alpha=-group["lr"] * scale)
+                p.add_(delta)
+
+                # Accumulated as tensors: .item() here would force a device sync per
+                # parameter, which is 160 stalls per step and ~14% of throughput.
+                self._update_sq = self._update_sq + delta.float().pow(2).sum()
+                self._param_sq = self._param_sq + p.detach().float().pow(2).sum()
 
 
 def split_parameters(model):
