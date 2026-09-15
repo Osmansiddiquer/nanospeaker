@@ -1,5 +1,5 @@
 # nanoSpeaker
-
+Try it out here: https://nanospeaker-web.vercel.app/
 A 382M-parameter sparse-MoE decoder (73M active per token) trained end to end on a
 single **4 GB RTX 3050 Ti laptop GPU** — pretraining, context extension, SFT,
 continued pretraining and RL, all on one card with 4 GB of VRAM.
